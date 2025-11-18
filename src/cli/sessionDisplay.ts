@@ -6,15 +6,18 @@ import {
   listSessionsMetadata,
   readSessionLog,
   readSessionMetadata,
+  readSessionRequest,
   SESSIONS_DIR,
   wait,
 } from '../sessionManager.js';
 import type { OracleResponseMetadata } from '../oracle.js';
 import { renderMarkdownAnsi } from './markdownRenderer.js';
+import { formatElapsed, formatUSD } from '../oracle/format.js';
+import { MODEL_CONFIGS } from '../oracle.js';
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? kleur.dim(text) : text);
-const MAX_RENDER_BYTES = 200_000;
+export const MAX_RENDER_BYTES = 200_000;
 
 export interface ShowStatusOptions {
   hours: number;
@@ -38,12 +41,17 @@ export async function showStatus({ hours, includeAll, limit, showExamples = fals
     return;
   }
   console.log(chalk.bold('Recent Sessions'));
+  console.log(chalk.dim('Timestamp             Chars  Cost  Status     Model      ID'));
   for (const entry of entries) {
     const statusRaw = (entry.status || 'unknown').padEnd(9);
     const status = richTty ? colorStatus(entry.status ?? 'unknown', statusRaw) : statusRaw;
     const model = (entry.model || 'n/a').padEnd(9);
-    const created = entry.createdAt.replace('T', ' ').replace('Z', '');
-    console.log(`${created} | ${status} | ${model} | ${entry.id}`);
+    const created = formatTimestamp(entry.createdAt);
+    const chars = entry.options?.prompt?.length ?? entry.promptPreview?.length ?? 0;
+    const charLabel = chars > 0 ? String(chars).padStart(5) : '    -';
+    const costValue = resolveCost(entry);
+    const costLabel = costValue != null ? formatUSD(costValue).padStart(6) : '     -';
+    console.log(`${created} | ${charLabel} | ${costLabel} | ${status} | ${model} | ${entry.id}`);
   }
   if (truncated) {
     console.log(
@@ -73,6 +81,7 @@ function colorStatus(status: string, padded: string): string {
 export interface AttachSessionOptions {
   suppressMetadata?: boolean;
   renderMarkdown?: boolean;
+  renderPrompt?: boolean;
 }
 
 type LiveRenderState = {
@@ -118,6 +127,14 @@ export async function attachSession(sessionId: string, options?: AttachSessionOp
   }
 
   const shouldTrimIntro = initialStatus === 'completed' || initialStatus === 'error';
+  if (options?.renderPrompt !== false) {
+    const prompt = await readStoredPrompt(sessionId);
+    if (prompt) {
+      console.log(chalk.bold('Prompt:'));
+      console.log(renderMarkdownAnsi(prompt));
+      console.log(dim('---'));
+    }
+  }
   if (shouldTrimIntro) {
     const fullLog = await readSessionLog(sessionId);
     const trimmed = trimBeforeFirstAnswer(fullLog);
@@ -236,9 +253,16 @@ export async function attachSession(sessionId: string, options?: AttachSessionOp
           console.log('\nResult:');
           console.log(`Session failed: ${latest.errorMessage}`);
         }
-        if (latest.usage && initialStatus === 'running') {
-          const usage = latest.usage;
-          console.log(`\nFinished (tok i/o/r/t: ${usage.inputTokens}/${usage.outputTokens}/${usage.reasoningTokens}/${usage.totalTokens})`);
+        if (latest.status === 'completed' && latest.usage) {
+          const summary = formatCompletionSummary(latest, { includeSlug: true });
+          if (summary) {
+            console.log(`\n${chalk.green.bold(summary)}`);
+          } else {
+            const usage = latest.usage;
+            console.log(
+              `\nFinished (tok i/o/r/t: ${usage.inputTokens}/${usage.outputTokens}/${usage.reasoningTokens}/${usage.totalTokens})`,
+            );
+          }
         }
       }
       break;
@@ -416,4 +440,70 @@ function extractRenderableChunks(text: string, state: LiveRenderState): { chunks
     buffer += segment;
   }
   return { chunks, remainder: buffer };
+}
+
+function formatTimestamp(iso: string): string {
+  const date = new Date(iso);
+  const locale = 'en-US';
+  const opts: Intl.DateTimeFormatOptions = {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: undefined,
+    hour12: true,
+  };
+  const formatted = date.toLocaleString(locale, opts);
+  return formatted.replace(/(, )(\d:)/, '$1 $2');
+}
+
+export function formatCompletionSummary(
+  metadata: SessionMetadata,
+  options: { includeSlug?: boolean } = {},
+): string | null {
+  if (!metadata.usage || metadata.elapsedMs == null) {
+    return null;
+  }
+  const modeLabel = metadata.mode === 'browser' ? `${metadata.model ?? 'n/a'}[browser]` : metadata.model ?? 'n/a';
+  const usage = metadata.usage;
+  const cost = metadata.mode === 'browser' ? null : resolveCost(metadata);
+  const costPart = cost != null ? ` | ${formatUSD(cost)}` : '';
+  const tokensDisplay = `${usage.inputTokens}/${usage.outputTokens}/${usage.reasoningTokens}/${usage.totalTokens}`;
+  const filesCount = metadata.options?.file?.length ?? 0;
+  const filesPart = filesCount > 0 ? ` | files=${filesCount}` : '';
+  const slugPart = options.includeSlug ? ` | slug=${metadata.id}` : '';
+  return `Finished in ${formatElapsed(metadata.elapsedMs)} (${modeLabel}${costPart} | tok(i/o/r/t)=${tokensDisplay}${filesPart}${slugPart})`;
+}
+
+function resolveCost(metadata: SessionMetadata): number | null {
+  if (metadata.mode === 'browser') {
+    return null;
+  }
+  if (metadata.usage?.cost != null) {
+    return metadata.usage.cost;
+  }
+  if (!metadata.model || !metadata.usage) {
+    return null;
+  }
+  const pricing = MODEL_CONFIGS[metadata.model as keyof typeof MODEL_CONFIGS]?.pricing;
+  if (!pricing) {
+    return null;
+  }
+  const input = metadata.usage.inputTokens ?? 0;
+  const output = metadata.usage.outputTokens ?? 0;
+  const cost = input * pricing.inputPerToken + output * pricing.outputPerToken;
+  return cost > 0 ? cost : null;
+}
+
+async function readStoredPrompt(sessionId: string): Promise<string | null> {
+  const request = await readSessionRequest(sessionId);
+  if (request?.prompt && request.prompt.trim().length > 0) {
+    return request.prompt;
+  }
+  const meta = await readSessionMetadata(sessionId);
+  if (meta?.options?.prompt && meta.options.prompt.trim().length > 0) {
+    return meta.options.prompt;
+  }
+  return null;
 }

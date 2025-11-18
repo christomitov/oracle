@@ -7,6 +7,7 @@ import {
   formatUserErrorMetadata,
   trimBeforeFirstAnswer,
   attachSession,
+  formatCompletionSummary,
 } from '../../src/cli/sessionDisplay.ts';
 import chalk from 'chalk';
 
@@ -16,6 +17,7 @@ vi.mock('../../src/sessionManager.ts', () => {
   return {
     readSessionMetadata: vi.fn(),
     readSessionLog: vi.fn(),
+    readSessionRequest: vi.fn(),
     wait: vi.fn(),
     listSessionsMetadata: vi.fn(),
     filterSessionsByRange: vi.fn(),
@@ -35,6 +37,8 @@ const markdownMock = await import('../../src/cli/markdownRenderer.ts');
 const renderMarkdownMock = markdownMock.renderMarkdownAnsi as unknown as { mockClear?: () => void };
 const readSessionMetadataMock = sessionManagerMock.readSessionMetadata as unknown as ReturnType<typeof vi.fn>;
 const readSessionLogMock = sessionManagerMock.readSessionLog as unknown as ReturnType<typeof vi.fn>;
+const readSessionRequestMock = sessionManagerMock.readSessionRequest as unknown as ReturnType<typeof vi.fn>;
+const _readSessionRequestMock = sessionManagerMock.readSessionRequest as unknown as ReturnType<typeof vi.fn>;
 
 const originalIsTty = process.stdout.isTTY;
 const originalChalkLevel = chalk.level;
@@ -136,15 +140,19 @@ describe('attachSession rendering', () => {
 
   beforeEach(() => {
     renderMarkdownMock?.mockClear?.();
+    readSessionRequestMock.mockReset();
   });
 
   test('renders markdown when requested and rich tty', async () => {
     readSessionMetadataMock.mockResolvedValue(baseMeta);
     readSessionLogMock.mockResolvedValue('Answer:\nhello *world*');
+    readSessionRequestMock.mockResolvedValue({ prompt: 'Prompt here' });
     const writeSpy = vi.spyOn(process.stdout, 'write');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     await attachSession('sess', { renderMarkdown: true });
 
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Prompt:'));
     expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledWith('Answer:\nhello *world*');
     expect(writeSpy).toHaveBeenCalledWith('RENDER:Answer:\nhello *world*');
   });
@@ -152,11 +160,15 @@ describe('attachSession rendering', () => {
   test('skips render when too large', async () => {
     readSessionMetadataMock.mockResolvedValue(baseMeta);
     readSessionLogMock.mockResolvedValue('A'.repeat(210_000));
+    readSessionRequestMock.mockResolvedValue({ prompt: 'Prompt here' });
     const writeSpy = vi.spyOn(process.stdout, 'write');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     await attachSession('sess', { renderMarkdown: true });
 
-    expect(markdownMock.renderMarkdownAnsi).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Prompt:'));
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledTimes(1);
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledWith(expect.stringContaining('Prompt here'));
     expect(writeSpy).toHaveBeenCalled(); // raw write
   });
 
@@ -164,6 +176,7 @@ describe('attachSession rendering', () => {
     const runningMeta: SessionMetadata = { ...baseMeta, status: 'running' };
     const completedMeta: SessionMetadata = { ...baseMeta, status: 'completed' };
     readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValueOnce(completedMeta);
+    readSessionRequestMock.mockResolvedValue({ prompt: 'Prompt here' });
     readSessionLogMock
       .mockResolvedValueOnce('Answer:\n| a | b |\n')
       .mockResolvedValueOnce('Answer:\n| a | b |\n| c | d |\n\nDone\n');
@@ -172,9 +185,10 @@ describe('attachSession rendering', () => {
 
     await attachSession('sess', { renderMarkdown: true });
 
-    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledTimes(2);
-    expect(markdownMock.renderMarkdownAnsi).toHaveBeenNthCalledWith(1, 'Answer:\n| a | b |\n| c | d |\n\n');
-    expect(markdownMock.renderMarkdownAnsi).toHaveBeenNthCalledWith(2, 'Done\n');
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledTimes(3);
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenNthCalledWith(1, expect.stringContaining('Prompt here'));
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenNthCalledWith(2, 'Answer:\n| a | b |\n| c | d |\n\n');
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenNthCalledWith(3, 'Done\n');
     expect(writeSpy).toHaveBeenCalledWith('RENDER:Answer:\n| a | b |\n| c | d |\n\n');
     expect(writeSpy).toHaveBeenCalledWith('RENDER:Done\n');
   });
@@ -183,6 +197,7 @@ describe('attachSession rendering', () => {
     const runningMeta: SessionMetadata = { ...baseMeta, status: 'running' };
     const completedMeta: SessionMetadata = { ...baseMeta, status: 'completed' };
     readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValueOnce(completedMeta);
+    readSessionRequestMock.mockResolvedValue({ prompt: 'Prompt here' });
     const huge = 'A'.repeat(210_000);
     readSessionLogMock.mockResolvedValueOnce(huge);
     const writeSpy = vi.spyOn(process.stdout, 'write');
@@ -191,8 +206,48 @@ describe('attachSession rendering', () => {
 
     await attachSession('sess', { renderMarkdown: true });
 
-    expect(markdownMock.renderMarkdownAnsi).not.toHaveBeenCalled();
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledTimes(1);
+    expect(markdownMock.renderMarkdownAnsi).toHaveBeenCalledWith(expect.stringContaining('Prompt here'));
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Render skipped'));
     expect(writeSpy).toHaveBeenCalledWith(huge);
+  });
+
+  test('suppresses prompt when renderPrompt is false', async () => {
+    readSessionMetadataMock.mockResolvedValue(baseMeta);
+    readSessionLogMock.mockResolvedValue('Answer:\nhello');
+    readSessionRequestMock.mockResolvedValue({ prompt: 'Hidden prompt' });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await attachSession('sess', { renderMarkdown: true, renderPrompt: false });
+
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('Prompt:'));
+  });
+
+  test('shows completion summary with cost and slug when available', async () => {
+    const metaWithUsage: SessionMetadata = {
+      ...baseMeta,
+      status: 'completed',
+      model: 'gpt-5-pro',
+      mode: 'api',
+      elapsedMs: 1234,
+      usage: { inputTokens: 10, outputTokens: 20, reasoningTokens: 0, totalTokens: 30, cost: 1.23 },
+    } as SessionMetadata;
+    const summary = formatCompletionSummary(metaWithUsage, { includeSlug: true });
+    expect(summary).not.toBeNull();
+    expect(summary).toContain('Finished in');
+    expect(summary).toContain('$1.23');
+    expect(summary).toContain('slug=sess');
+  });
+
+  test('falls back to metadata prompt when request is missing', async () => {
+    readSessionMetadataMock.mockResolvedValue({ ...baseMeta, options: { prompt: 'From meta' } });
+    readSessionLogMock.mockResolvedValue('Answer:\nhello');
+    readSessionRequestMock.mockResolvedValue(null);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await attachSession('sess', { renderMarkdown: true });
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Prompt:'));
+    expect(renderMarkdownMock).toHaveBeenCalledWith('Answer:\nhello');
   });
 });
